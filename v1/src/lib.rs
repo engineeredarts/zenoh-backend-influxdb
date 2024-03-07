@@ -50,6 +50,7 @@ pub const PROP_STORAGE_CREATE_DB: &str = "create_db";
 pub const PROP_STORAGE_ON_CLOSURE: &str = "on_closure";
 pub const PROP_STORAGE_USERNAME: &str = PROP_BACKEND_USERNAME;
 pub const PROP_STORAGE_PASSWORD: &str = PROP_BACKEND_PASSWORD;
+pub const PROP_STORAGE_PUT_BATCH_SIZE: &str = "put_batch_size";
 
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
@@ -189,6 +190,17 @@ impl Volume for InfluxDbBackend {
             Some(v) => v,
             None => bail!("InfluxDB backed storages need some volume-specific configuration"),
         };
+
+        // Collect PUT requests and send in batches for efficiency?
+        let put_batch_size = if let Some(serde_json::Value::Number(put_batch_size)) =
+            volume_cfg.get(PROP_STORAGE_PUT_BATCH_SIZE)
+        {
+            debug!("PUT queries will be sent in batches of {}", put_batch_size);
+            put_batch_size.as_u64()
+        } else {
+            None
+        };
+
         let on_closure = match volume_cfg.get(PROP_STORAGE_ON_CLOSURE) {
             Some(serde_json::Value::String(x)) if x == "drop_series" => OnClosure::DropSeries,
             Some(serde_json::Value::String(x)) if x == "drop_db" => OnClosure::DropDb,
@@ -268,6 +280,8 @@ impl Volume for InfluxDbBackend {
             client,
             on_closure,
             timer: Timer::default(),
+            put_batch_size,
+            put_batch: Vec::new(),
         }))
     }
 
@@ -310,6 +324,8 @@ struct InfluxDbStorage {
     client: Client,
     on_closure: OnClosure,
     timer: Timer,
+    put_batch_size: Option<u64>,
+    put_batch: Vec<InfluxWQuery>,
 }
 
 impl InfluxDbStorage {
@@ -427,15 +443,45 @@ impl Storage for InfluxDbStorage {
         .add_field("encoding_suffix", value.encoding.suffix())
         .add_field("base64", base64)
         .add_field("value", strvalue);
-        debug!("Put {:?} with Influx query: {:?}", measurement, query);
-        if let Err(e) = self.client.query(&query).await {
-            bail!(
-                "Failed to put Value for {:?} in InfluxDb storage : {}",
-                measurement,
-                e
-            )
-        } else {
-            Ok(StorageInsertionResult::Inserted)
+
+        match self.put_batch_size {
+            None => {
+                // not batched - send query nows
+                debug!("Put {:?} with Influx query: {:?}", measurement, query);
+                if let Err(e) = self.client.query(&query).await {
+                    bail!(
+                        "Failed to put Value for {:?} in InfluxDb storage : {}",
+                        measurement,
+                        e
+                    )
+                } else {
+                    Ok(StorageInsertionResult::Inserted)
+                }
+            }
+            Some(put_batch_size) => {
+                // add query to current batch...
+                self.put_batch.push(query);
+
+                // ...and only send if the batch is full
+                let n = self.put_batch.len() as u64;
+                if n >= put_batch_size {
+                    debug!("Put {:?} batch of {}", measurement, n);
+                    let result = self.client.query(&self.put_batch).await;
+                    self.put_batch.clear();
+
+                    if let Err(e) = result {
+                        bail!(
+                            "Failed to put Value for batch of {} {:?} in InfluxDb storage : {}",
+                            n,
+                            measurement,
+                            e
+                        )
+                    }
+                }
+
+                // assume success if batch is not ready to send
+                Ok(StorageInsertionResult::Inserted)
+            }
         }
     }
 
