@@ -12,8 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use async_std::channel;
-use async_std::task;
+use async_std::{channel, future, task};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as b64_std_engine, Engine};
 use influxdb::{
@@ -197,6 +196,7 @@ impl Volume for InfluxDbBackend {
             Some(v) => v.as_u64().map(|v| v as usize),
             None => None,
         };
+        let put_batch_timeout = Duration::from_secs(1);
 
         let on_closure = match volume_cfg.get(PROP_STORAGE_ON_CLOSURE) {
             Some(serde_json::Value::String(x)) if x == "drop_series" => OnClosure::DropSeries,
@@ -282,32 +282,53 @@ impl Volume for InfluxDbBackend {
                 let mut put_batch: Vec<InfluxWQuery> = Vec::new();
 
                 loop {
-                    match rx.recv().await {
-                        Ok(Put { query, measurement }) => {
-                            // add query to current batch...
-                            put_batch.push(query);
-
-                            // ...and only send if the batch is full
-                            let n = put_batch.len();
-                            if n >= put_batch_size {
-                                debug!("Put {:?} batch of {}", measurement, n);
-                                let result = client_clone.query(&put_batch).await;
-                                put_batch.clear();
-
-                                if let Err(e) = result {
-                                    debug!(
-                                        "Failed to put Value for {:?} batch of {} in InfluxDb storage : {}",
-                                        measurement,
-                                        n,
-                                        e
-                                    )
-                                }
+                    if put_batch.is_empty() {
+                        // waiting for first batch item...
+                        match rx.recv().await {
+                            Ok(Put {
+                                query,
+                                measurement: _,
+                            }) => {
+                                // begin batch...
+                                put_batch.push(query);
+                            }
+                            Err(e) => {
+                                debug!("Error receiving put for batch, exiting task - {:?}", e);
+                                break;
                             }
                         }
+                    } else {
+                        // ...and wait for more items
+                        let batch_ready = match future::timeout(put_batch_timeout, rx.recv()).await
+                        {
+                            Ok(r) => match r {
+                                Ok(Put {
+                                    query,
+                                    measurement: _,
+                                }) => {
+                                    put_batch.push(query);
+                                    put_batch.len() >= put_batch_size
+                                }
+                                Err(e) => {
+                                    debug!("Error receiving put for batch, exiting task - {:?}", e);
+                                    break;
+                                }
+                            },
+                            Err(_e) => true,
+                        };
 
-                        Err(e) => {
-                            debug!("Error receiving put for batch, exiting task - {:?}", e);
-                            break;
+                        if batch_ready {
+                            let n = put_batch.len();
+                            debug!("Put batch of {}", n);
+                            let result = client_clone.query(&put_batch).await;
+                            put_batch.clear();
+
+                            if let Err(e) = result {
+                                debug!(
+                                    "Failed to put Value for batch of {} in InfluxDb storage : {}",
+                                    n, e
+                                )
+                            }
                         }
                     }
                 }
