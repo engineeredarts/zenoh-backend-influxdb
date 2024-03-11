@@ -12,6 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+use async_std::channel;
 use async_std::task;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as b64_std_engine, Engine};
@@ -51,6 +52,7 @@ pub const PROP_STORAGE_ON_CLOSURE: &str = "on_closure";
 pub const PROP_STORAGE_USERNAME: &str = PROP_BACKEND_USERNAME;
 pub const PROP_STORAGE_PASSWORD: &str = PROP_BACKEND_PASSWORD;
 pub const PROP_STORAGE_PUT_BATCH_SIZE: &str = "put_batch_size";
+pub const PROP_STORAGE_PUT_BATCH_TIMEOUT: &str = "put_batch_timeout";
 
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
@@ -191,14 +193,9 @@ impl Volume for InfluxDbBackend {
             None => bail!("InfluxDB backed storages need some volume-specific configuration"),
         };
 
-        // Collect PUT requests and send in batches for efficiency?
-        let put_batch_size = if let Some(serde_json::Value::Number(put_batch_size)) =
-            volume_cfg.get(PROP_STORAGE_PUT_BATCH_SIZE)
-        {
-            debug!("PUT queries will be sent in batches of {}", put_batch_size);
-            put_batch_size.as_u64()
-        } else {
-            None
+        let put_batch_size: Option<usize> = match volume_cfg.get(PROP_STORAGE_PUT_BATCH_SIZE) {
+            Some(v) => v.as_u64().map(|v| v as usize),
+            None => None,
         };
 
         let on_closure = match volume_cfg.get(PROP_STORAGE_ON_CLOSURE) {
@@ -274,14 +271,60 @@ impl Volume for InfluxDbBackend {
             admin_client = admin_client.with_auth(username, password);
         }
 
+        // Collect PUT requests and send in batches for efficiency?
+        let put_batch_tx = if let Some(put_batch_size) = put_batch_size {
+            debug!("PUT queries will be sent in batches of {}", put_batch_size);
+
+            let (tx, rx) = channel::unbounded::<Put>();
+
+            let client_clone = client.clone();
+            task::spawn(async move {
+                let mut put_batch: Vec<InfluxWQuery> = Vec::new();
+
+                loop {
+                    match rx.recv().await {
+                        Ok(Put { query, measurement }) => {
+                            // add query to current batch...
+                            put_batch.push(query);
+
+                            // ...and only send if the batch is full
+                            let n = put_batch.len();
+                            if n >= put_batch_size {
+                                debug!("Put {:?} batch of {}", measurement, n);
+                                let result = client_clone.query(&put_batch).await;
+                                put_batch.clear();
+
+                                if let Err(e) = result {
+                                    debug!(
+                                        "Failed to put Value for {:?} batch of {} in InfluxDb storage : {}",
+                                        measurement,
+                                        n,
+                                        e
+                                    )
+                                }
+                            }
+                        }
+
+                        Err(e) => {
+                            debug!("Error receiving put for batch, exiting task - {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            Some(tx)
+        } else {
+            None
+        };
+
         Ok(Box::new(InfluxDbStorage {
             config,
             admin_client,
             client,
             on_closure,
             timer: Timer::default(),
-            put_batch_size,
-            put_batch: Vec::new(),
+            put_batch_tx,
         }))
     }
 
@@ -318,14 +361,19 @@ impl TryFrom<&Properties> for OnClosure {
     }
 }
 
+struct Put {
+    measurement: OwnedKeyExpr,
+    query: InfluxWQuery,
+}
+
 struct InfluxDbStorage {
     config: StorageConfig,
     admin_client: Client,
     client: Client,
     on_closure: OnClosure,
     timer: Timer,
-    put_batch_size: Option<u64>,
-    put_batch: Vec<InfluxWQuery>,
+    put_batch_tx: Option<channel::Sender<Put>>, // put_batch_size: Option<u64>,
+                                                // put_batch: Vec<InfluxWQuery>,
 }
 
 impl InfluxDbStorage {
@@ -444,7 +492,7 @@ impl Storage for InfluxDbStorage {
         .add_field("base64", base64)
         .add_field("value", strvalue);
 
-        match self.put_batch_size {
+        match &self.put_batch_tx {
             None => {
                 // not batched - send query nows
                 debug!("Put {:?} with Influx query: {:?}", measurement, query);
@@ -458,29 +506,15 @@ impl Storage for InfluxDbStorage {
                     Ok(StorageInsertionResult::Inserted)
                 }
             }
-            Some(put_batch_size) => {
-                // add query to current batch...
-                self.put_batch.push(query);
-
-                // ...and only send if the batch is full
-                let n = self.put_batch.len() as u64;
-                if n >= put_batch_size {
-                    debug!("Put {:?} batch of {}", measurement, n);
-                    let result = self.client.query(&self.put_batch).await;
-                    self.put_batch.clear();
-
-                    if let Err(e) = result {
-                        bail!(
-                            "Failed to put Value for batch of {} {:?} in InfluxDb storage : {}",
-                            n,
-                            measurement,
-                            e
-                        )
-                    }
+            Some(sender) => {
+                let put = Put { query, measurement };
+                if let Err(e) = sender.try_send(put) {
+                    bail!("Failed to send to batch queue for InfluxDb storage : {}", e)
+                } else {
+                    // assume success
+                    // TODO - add pending status
+                    Ok(StorageInsertionResult::Inserted)
                 }
-
-                // assume success if batch is not ready to send
-                Ok(StorageInsertionResult::Inserted)
             }
         }
     }
