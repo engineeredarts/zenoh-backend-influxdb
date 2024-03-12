@@ -20,6 +20,7 @@ use influxdb::{
 };
 use log::{debug, error, warn};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -51,13 +52,16 @@ pub const PROP_STORAGE_ON_CLOSURE: &str = "on_closure";
 pub const PROP_STORAGE_USERNAME: &str = PROP_BACKEND_USERNAME;
 pub const PROP_STORAGE_PASSWORD: &str = PROP_BACKEND_PASSWORD;
 pub const PROP_STORAGE_PUT_BATCH_SIZE: &str = "put_batch_size";
-pub const PROP_STORAGE_PUT_BATCH_TIMEOUT: &str = "put_batch_timeout";
+pub const PROP_STORAGE_PUT_BATCH_TIMEOUT_MS: &str = "put_batch_timeout_ms";
 
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
 
 // delay after deletion to drop a measurement
 const DROP_MEASUREMENT_TIMEOUT_MS: u64 = 5000;
+
+// default batch timeout
+const DEFAULT_BATCH_TIMEOUT_MS: u64 = 1000;
 
 const GIT_VERSION: &str = git_version::git_version!(prefix = "v", cargo_prefix = "v");
 lazy_static::lazy_static!(
@@ -192,11 +196,16 @@ impl Volume for InfluxDbBackend {
             None => bail!("InfluxDB backed storages need some volume-specific configuration"),
         };
 
+        // batching
         let put_batch_size: Option<usize> = match volume_cfg.get(PROP_STORAGE_PUT_BATCH_SIZE) {
             Some(v) => v.as_u64().map(|v| v as usize),
             None => None,
         };
-        let put_batch_timeout = Duration::from_secs(1);
+        let put_batch_timeout_ms = match volume_cfg.get(PROP_STORAGE_PUT_BATCH_TIMEOUT_MS) {
+            Some(v) => v.as_u64().unwrap_or(DEFAULT_BATCH_TIMEOUT_MS),
+            None => DEFAULT_BATCH_TIMEOUT_MS,
+        };
+        let put_batch_timeout = Duration::from_millis(put_batch_timeout_ms);
 
         let on_closure = match volume_cfg.get(PROP_STORAGE_ON_CLOSURE) {
             Some(serde_json::Value::String(x)) if x == "drop_series" => OnClosure::DropSeries,
@@ -273,59 +282,88 @@ impl Volume for InfluxDbBackend {
 
         // Collect PUT requests and send in batches for efficiency?
         let put_batch_tx = if let Some(put_batch_size) = put_batch_size {
-            debug!("PUT queries will be sent in batches of {}", put_batch_size);
+            debug!(
+                "[{}] PUT queries will be sent in batches of {} or after {:#?}",
+                config.name, put_batch_size, put_batch_timeout
+            );
 
             let (tx, rx) = channel::unbounded::<Put>();
 
             let client_clone = client.clone();
+            let name_clone = config.name.clone();
             task::spawn(async move {
                 let mut put_batch: Vec<InfluxWQuery> = Vec::new();
+                let mut measurement_counts: HashMap<OwnedKeyExpr, u64> = HashMap::new();
 
+                let mut batch_start_time = Instant::now();
                 loop {
                     if put_batch.is_empty() {
                         // waiting for first batch item...
                         match rx.recv().await {
-                            Ok(Put {
-                                query,
-                                measurement: _,
-                            }) => {
+                            Ok(Put { query, measurement }) => {
                                 // begin batch...
                                 put_batch.push(query);
+                                measurement_counts
+                                    .entry(measurement)
+                                    .and_modify(|counter| *counter += 1)
+                                    .or_insert(1);
+                                batch_start_time = Instant::now();
                             }
                             Err(e) => {
-                                debug!("Error receiving put for batch, exiting task - {:?}", e);
+                                debug!(
+                                    "[{}] Error receiving put for batch, exiting task - {:?}",
+                                    name_clone, e
+                                );
                                 break;
                             }
                         }
                     } else {
                         // ...and wait for more items
-                        let batch_ready = match future::timeout(put_batch_timeout, rx.recv()).await
-                        {
+                        match future::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(r) => match r {
-                                Ok(Put {
-                                    query,
-                                    measurement: _,
-                                }) => {
+                                Ok(Put { query, measurement }) => {
+                                    // add to batch
                                     put_batch.push(query);
-                                    put_batch.len() >= put_batch_size
+                                    measurement_counts
+                                        .entry(measurement)
+                                        .and_modify(|counter| *counter += 1)
+                                        .or_insert(1);
                                 }
                                 Err(e) => {
-                                    debug!("Error receiving put for batch, exiting task - {:?}", e);
+                                    debug!(
+                                        "[{}] Error receiving put for batch, exiting task - {:?}",
+                                        name_clone, e
+                                    );
                                     break;
                                 }
                             },
-                            Err(_e) => true,
+                            Err(_) => {
+                                // timeout
+                            }
                         };
 
-                        if batch_ready {
+                        let batch_full = put_batch.len() >= put_batch_size;
+                        let batch_timed_out = batch_start_time.elapsed() > put_batch_timeout;
+
+                        if batch_full || batch_timed_out {
                             let n = put_batch.len();
-                            debug!("Put batch of {}", n);
+
+                            let counts: Vec<String> = measurement_counts
+                                .drain()
+                                .map(|(k, v)| format!("{k} x {v}"))
+                                .collect();
+                            debug!(
+                                "[{}] PUT batch of {} - {}",
+                                name_clone,
+                                n,
+                                counts.join(", ")
+                            );
                             let result = client_clone.query(&put_batch).await;
                             put_batch.clear();
 
                             if let Err(e) = result {
                                 debug!(
-                                    "Failed to put Value for batch of {} in InfluxDb storage : {}",
+                                    "[{}] Failed to put Value for batch of {} in InfluxDb storage : {}", name_clone,
                                     n, e
                                 )
                             }
